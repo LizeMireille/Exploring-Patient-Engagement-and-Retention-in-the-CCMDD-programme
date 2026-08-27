@@ -1,0 +1,174 @@
+---
+title: "Step 8 — Combining medication groups with the package data (dropping blank gender/supply)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# load in libraries
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(readxl)
+library(data.table)
+library(skimr)
+```
+
+# Purpose
+
+
+This file joins the medication-group flags created in Step 5 onto the package-level data with distances created in Step 7, then removes records that are too incomplete to use downstream.
+
+Two exclusions are applied:
+
+- rows with a blank `Gender`
+- rows with a blank or `"NULL"` `Months Supplied` or `Prescription Length`
+
+The supply fields are available for patients matched to the October extract during the Step 2 enrichment. This filter therefore restricts the dataset to records with complete gender and supply information. The number of rows removed by each exclusion is reported below.
+
+Inputs:
+- `packages_with_distance` from Step 7
+- `medication_groups` from Step 5
+
+Output:
+- `package_level_clean` (cleaned package-level dataset used in the patient-level steps)
+
+
+# Configuration
+
+```{r config}
+# Steps 5 and 7 must be run first to create the required R objects.
+if (!exists("packages_with_distance")) {
+  stop("Run Step 7 first to create `packages_with_distance`.")
+}
+
+if (!exists("medication_groups")) {
+  stop("Run Step 5 first to create `medication_groups`.")
+}
+```
+
+# Load inputs
+
+```{r load}
+# create working copies of the objects produced in earlier steps.
+full_with_distance <- copy(packages_with_distance)
+med_groups <- copy(medication_groups)
+
+setDT(full_with_distance)
+setDT(med_groups)
+```
+
+# Apply the exclusions
+
+```{r drop-blank-gender}
+# Drop rows with no Gender.
+n_before <- nrow(full_with_distance)
+full_with_distance <- full_with_distance[!is.na(Gender) & trimws(as.character(Gender)) != ""]
+message("Dropped blank-gender rows: ", n_before - nrow(full_with_distance))
+```
+
+```{r drop-blank-supply}
+# Treat NA, "", and "NULL" (any case) as blank - the original code relied on
+# data.table dropping NA rows; this makes that behaviour explicit.
+is_blank <- function(x) {
+  x <- trimws(as.character(x))
+  is.na(x) | x == "" | toupper(x) == "NULL"
+}
+
+n_before <- nrow(full_with_distance)
+full_with_distance <- full_with_distance[
+  !is_blank(`Months Supplied`) & !is_blank(`Prescription Length`)
+]
+message("Dropped blank Months Supplied / Prescription Length rows: ",
+        n_before - nrow(full_with_distance))
+```
+
+```{r qc-values}
+# Sanity check the fields we filtered on.
+unique(full_with_distance$Gender)
+sort(unique(full_with_distance$`Months Supplied`))
+sort(unique(full_with_distance$`Prescription Length`))
+```
+
+# Join the medication-group flags
+
+```{r join-med-groups}
+# med_groups holds id, prescription_id, patient_id, and the 18 group flag columns.
+# Take only the group-flag columns that are not already in the package data.
+group_cols <- setdiff(
+  names(med_groups),
+  c("id", names(full_with_distance))
+)
+
+# One row per package id.
+med_groups <- unique(med_groups, by = "id")
+
+# Align medication-group values to full_with_distance by package id.
+group_vals <- med_groups[
+  full_with_distance,
+  on = "id",
+  ..group_cols
+]
+
+package_level_clean <- copy(full_with_distance)
+
+for (nm in names(group_vals)) {
+  package_level_clean[, (nm) := group_vals[[nm]]]
+}
+
+# prescriptions with no mapped medication group should have 0, not NA.
+for (nm in group_cols) {
+  set(package_level_clean, which(is.na(package_level_clean[[nm]])), nm, 0L)
+}
+```
+
+# Drop leftover helper columns
+
+```{r drop-helpers}
+# Engineering/QC columns that leaked in from earlier steps (e.g. `is_dup` from
+# Step 3). Dropped defensively: only those actually present are removed, so this
+# never errors if an upstream step already cleaned them up.
+helper_cols <- intersect(
+  c("is_dup", "year_band", "pref_nonempty", "items_clean", "items_len"),
+  names(package_level_clean)
+)
+
+if (length(helper_cols)) {
+  package_level_clean[, (helper_cols) := NULL]
+}
+```
+
+# QC: medication-group coverage
+
+```{r qc-med-coverage}
+# The 18 expected group columns
+all_groups <- c(
+  "Cardiovascular conditions", "Central nervous system conditions",
+  "Ear, nose and throat conditions", "Emergencies and injuries",
+  "Endocrine conditions", "Eye conditions", "Family planning",
+  "Gastro-intestinal conditions", "HIV and AIDS",
+  "Infections and related conditions", "Kidney and urological disorders",
+  "Mental health conditions", "Musculoskeletal conditions",
+  "Nutrition and anaemia", "Obstetrics and Gynaecology", "Pain",
+  "Respiratory conditions", "Skin conditions"
+)
+
+# all 18 group columns must be present so a renamed or missing group column
+# cannot pass through silently.
+missing_group_cols <- setdiff(all_groups, names(package_level_clean))
+stopifnot(length(missing_group_cols) == 0)
+
+# rows with no medication group (all 18 flags 0): the prescription's drugs did not map, or its Prescription Items was empty. We KEEP these - an all-zero vector is a valid "none of these groups" state - and just report how many.
+n_total    <- nrow(package_level_clean)
+n_all_zero <- package_level_clean[, sum(rowSums(.SD != 0, na.rm = TRUE) == 0), .SDcols = all_groups]
+message("Rows with no medication group (all 18 flags 0): ", n_all_zero,
+        " of ", n_total, " (", round(100 * n_all_zero / n_total, 2), "%) - kept")
+```
+
+
+# Quick look
+
+```{r summary}
+
+skim(package_level_clean)
+```

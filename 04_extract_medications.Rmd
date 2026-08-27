@@ -1,0 +1,137 @@
+---
+title: "Step 4 — Extracting unique medication names"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(data.table)
+library(tidyr)
+library(stringr)
+```
+
+# Purpose
+
+This file takes the `Prescription Items` field from the package-level dataset created in Step 3 and cleans it into individual medication names.
+
+The medication text is standardised, split into individual drugs, and cleaned to remove dosage and formulation information.
+
+Inputs:
+- `packages_scripts_merged` from Step 3
+
+Outputs:
+- `prescription_drugs` (one row per `prescription_id` and cleaned drug name)
+- `unique_drug_names_for_mapping` (distinct cleaned drug names used for the manual medication/disease-group mapping)
+
+
+`unique_drug_names_for_mapping` is used for the manual mapping step, where each cleaned drug name is assigned a medication/disease group. The completed mapping is used in Step 5.
+
+
+# Configuration
+
+```{r config}
+# Step 3 must be run first to create the package-prescription object.
+if (!exists("packages_scripts_merged")) {
+  stop("Run Step 3 first to create `packages_scripts_merged`.")
+}
+
+# Output file for the manual drug-mapping step.
+drug_names_csv <- "unique_drug_names_for_mapping.csv"
+
+```
+
+```{r data table}
+# package-level dataset created in Step 3.
+full <- copy(packages_scripts_merged)
+setDT(full)
+```
+
+# Normalise the Prescription Items text
+
+One row per prescription, with the items string normalised: parenthetical notes removed, lower-cased, and all delimiters (commas, semicolons, slashes) unified to `;` 
+
+```{r normalise-items}
+meds <- full %>%
+  select(prescription_id, prescription_items = `Prescription Items`) %>%
+  mutate(
+    prescription_items = str_remove_all(prescription_items, "\\s*\\(.*?\\)\\s*"), # drop "(...)" notes
+    prescription_items = str_to_lower(prescription_items),
+    prescription_items = str_replace_all(prescription_items, "[,;/]+", ";"),      # unify delimiters
+    prescription_items = str_remove_all(prescription_items, "^;+|;+$"),           # trim stray ;
+    prescription_items = na_if(prescription_items, "")
+  ) %>%
+  distinct(prescription_id, .keep_all = TRUE)
+```
+
+# Split into individual drugs and clean each name
+
+`form_words` are dosage-form / packaging tokens (e.g. "tab", "inhaler", "suspension") that are not part of the drug name and are stripped out. Glued dose+form tokens (e.g. "5mgtab", "3mgtab") are removed as well.
+
+```{r clean-drug-names}
+
+
+form_words <- c(
+  # tablet / capsule forms
+  "tab", "tabs", "tablet", "tablets", "table",
+  "cap", "capsule", "caps", "capsules",
+  # other dosage forms
+  "inh", "inhaler", "dose", "spray", "syrup", "ointment", "cream", "gel",
+  "lotion", "suspension", "susp", "solution", "soln", "soluble", "liquid",
+  "mixture", "injection", "inj", "vial", "ampoule", "neb", "nebule",
+  "patch", "pessary", "suppository", "drop", "drops", "chew",
+  # route / packaging descriptors
+  "sl", "eye", "oral", "nasal", "wide mouth", "disp", "dispersable",
+  # irregular fragments seen in the raw data 
+  "mgtab", "mg tab", "2ug 0dose", "drops50u", "dtg -"
+)
+form_pattern <- paste0("(?<=^|\\s)(", paste(form_words, collapse = "|"), ")(?=\\s|$)")
+
+meds_long <- meds %>%
+  separate_rows(prescription_items, sep = ";|\\s+and\\s+") %>%
+  mutate(
+    med_raw = str_squish(prescription_items),
+    drug_clean = med_raw %>%
+      # dose + any glued form suffix, e.g. "500mg", "5ml", "5mgtab", "3mgtab", "5ml inj"
+      str_remove_all("(?<![A-Za-z0-9])\\d+/?\\d*\\s*(?:mg|mcg|g|ml|%)\\s*(?:tabs?|tablets?|caps?|capsules?|inj|injection)?(?![a-z])") %>%
+      str_remove_all(form_pattern) %>%                                              # form words
+      str_remove_all("\\b(cr|xr)\\b") %>%                                           # CR/XR markers
+      str_remove_all("(?<![A-Za-z])\\d+(?![A-Za-z])") %>%                           # stray numbers
+      str_remove_all("\\.") %>%                                                     # stray dots
+      str_squish()
+  ) %>%
+  # drop blanks and 1-2 character fragments (too short to be a real drug name).
+  filter(drug_clean != "", nchar(drug_clean) > 2)
+```
+
+# Create mapping table
+
+```{r save}
+# one row per prescription_id and cleaned drug name.
+prescription_drugs <- meds_long %>%
+  distinct(prescription_id, drug_clean)
+
+# distinct cleaned drug names for the manual mapping step.
+unique_drug_names_for_mapping <- data.frame(
+  drug_clean = sort(unique(prescription_drugs$drug_clean)),
+  stringsAsFactors = FALSE
+)
+
+# export the unique drug list for manual classification.
+write.csv(
+  unique_drug_names_for_mapping,
+  drug_names_csv,
+  row.names = FALSE
+)
+```
+
+# Quick look
+
+```{r summary}
+
+head(prescription_drugs)
+head(unique_drug_names_for_mapping)
+
+nrow(prescription_drugs)
+nrow(unique_drug_names_for_mapping)
+```

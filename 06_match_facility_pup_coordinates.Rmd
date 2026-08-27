@@ -1,0 +1,327 @@
+---
+title: "Step 6 — Matching facilities & pickup points to coordinates"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(readxl)
+library(data.table)
+library(openxlsx)
+```
+
+# Purpose
+
+This file matches the distinct facilities and pickup points in the package-level dataset created in Step 3 to geographic coordinates.
+
+Two coordinate reference sources are used:
+
+- `PuPs_geolocation.xlsx`
+- DHIS facility master list
+
+The final matching approach uses exact-string matching in three passes. Each pass attempts to match names that remained unmatched after the previous one:
+
+1. exact match on the combined reference name,
+2. exact match on the DHIS short facility name,
+3. exact match on the DHIS short facility name after removing the word "clinic" from both sides.
+
+Each matched row records the matching `method` and coordinate `src` so that the process can be reviewed.
+
+Rows that remain unmatched are exported to `locations_match_audit.xlsx`. Missing coordinates are then completed manually, producing the completed location mapping used in the next step.
+
+Inputs:
+- `packages_scripts_merged` from Step 3
+- `PuPs_geolocation.xlsx` (raw reference file)
+- DHIS facility master list (raw reference file)
+
+Outputs:
+- `fac_match_table` (R object containing facility coordinate matches)
+- `pp_match_table` (R object containing pickup-point coordinate matches)
+- `locations_match_audit.xlsx` (exported for manual review and completion)
+
+
+
+# Configuration
+
+```{r config}
+# Step 3 must be run first to create the package-prescription object.
+if (!exists("packages_scripts_merged")) {
+  stop("Run Step 3 first to create `packages_scripts_merged`.")
+}
+
+# Paths to the raw coordinate reference files.
+# The raw files are not included in this repository.
+pup_geo_xlsx <- "......."
+dhis_xlsx    <- "......."
+
+# Sheet containing the DHIS facility master data.
+dhis_sheet <- "DHIS Master data download (2)"
+
+# Output for the manual coordinate-review step.
+audit_out_xlsx <- "locations_match_audit.xlsx"
+```
+
+# Load inputs
+
+```{r load}
+# create a working copy of the package-level dataset from Step 3.
+full <- copy(packages_scripts_merged)
+
+# coordinate reference data.
+locations  <- read_excel(pup_geo_xlsx)
+facilities <- read_excel(dhis_xlsx, sheet = dhis_sheet)
+```
+
+# Build the combined reference table
+
+Pickup-point and facility coordinates are stacked into one reference keyed on `ref_name`. Facility names have their leading two-letter province abbreviation stripped. Where the same name exists in both sources, the facility record is kept (DHIS is the more known source).
+
+```{r reference-table}
+# pickup-point geolocations.
+locs_locations_long <- locations %>%
+  transmute(
+    ref_name  = Name,
+    Longitude = suppressWarnings(as.numeric(Longitude)),
+    Latitude  = suppressWarnings(as.numeric(Latitude)),
+    src       = "locations"
+  )
+
+# DHIS facilities (strip the leading province abbreviation, e.g. "wc ").
+locs_facilities_long <- facilities %>%
+  transmute(
+    ref_name_raw = `Facility Name`,
+    Longitude    = suppressWarnings(as.numeric(longitude)),
+    Latitude     = suppressWarnings(as.numeric(latitude)),
+    src          = "facilities"
+  ) %>%
+  mutate(ref_name = str_remove(ref_name_raw, "^[a-z]{2}\\s+")) %>%
+  select(ref_name, ref_name_raw, Longitude, Latitude, src)
+
+
+# combine the pickup-point and DHIS facility coordinate references.
+# keep only records with valid names and coordinates- if the same in both sources, keep the DHIS first
+locs_ref_long <- bind_rows(locs_locations_long, locs_facilities_long) %>%
+  filter(!is.na(Longitude), !is.na(Latitude), !is.na(ref_name), ref_name != "") %>%
+  arrange(factor(src, levels = c("facilities", "locations"))) %>%  # facilities first
+  distinct(ref_name, .keep_all = TRUE)                             # prefer facilities
+```
+
+# Helper functions
+
+```{r helpers}
+
+# remove a whole word from a name and clean up extra spaces -- clinic
+# matching is case-insensitive
+rm_word <- function(x, word = "clinic") {
+  x %>%
+    str_replace_all(paste0("(?i)\\b", word, "\\b"), "") %>%
+    str_squish()
+}
+
+
+# return first value in a vector that is not missing and not blank
+# used when several rows belong to the same site and we need to keep one usable admin label, such as province, district or sub-district
+first_nm <- function(x) {
+  ix <- which(!is.na(x) & x != "")
+  if (length(ix)) x[ix[1]] else NA_character_
+}
+
+# match a set of site names to the coordinate reference table using exact name matching.
+# this only matches names where Name is exactly the same as ref_name.
+match_coords <- function(vec_names, ref_tbl) {
+  target <- tibble(Name = vec_names) %>%
+    distinct() %>%
+    filter(!is.na(Name), Name != "")
+
+  target %>%
+    left_join(
+      ref_tbl %>% mutate(ref_name_keep = ref_name, ref_name_raw_keep = ref_name_raw),
+      by = c("Name" = "ref_name")
+    ) %>%
+    transmute(
+      Name,
+      matched_ref     = ref_name_keep,       # matched reference name
+      matched_ref_raw = ref_name_raw_keep,   # original DHIS name (with province prefix)
+      Longitude, Latitude, src,
+      method = ifelse(!is.na(Longitude) & !is.na(Latitude), "raw_exact", NA_character_)
+    ) %>%
+    distinct(Name, .keep_all = TRUE)
+}
+
+# Add rescue matches to the base match table
+# rescue matches are only used where the original exact match did not find coordinates
+# existing successful matches are kept and are not overwritten
+apply_rescue <- function(base_tbl, hits_tbl) {
+  if (nrow(hits_tbl) == 0) return(base_tbl)
+  base_tbl %>%
+    left_join(
+      hits_tbl %>% rename(
+        matched_ref_hit     = matched_ref,
+        matched_ref_raw_hit = matched_ref_raw,
+        Longitude_hit       = Longitude,
+        Latitude_hit        = Latitude,
+        src_hit             = src,
+        method_hit          = method
+      ),
+      by = "Name"
+    ) %>%
+    mutate(
+      matched_ref     = coalesce(matched_ref,     matched_ref_hit),
+      matched_ref_raw = coalesce(matched_ref_raw, matched_ref_raw_hit),
+      Longitude       = coalesce(Longitude,       Longitude_hit),
+      Latitude        = coalesce(Latitude,        Latitude_hit),
+      src             = coalesce(src,             src_hit),
+      method          = coalesce(method,          method_hit)
+    ) %>%
+    select(Name, matched_ref, matched_ref_raw, Longitude, Latitude, src, method)
+}
+```
+
+# Distinct names to match (from the merged data)
+
+```{r unique-names}
+fac_unique <- full %>%
+  filter(!is.na(Facility), Facility != "") %>%
+  distinct(Facility) %>%
+  rename(Name = Facility)
+
+pp_unique <- full %>%
+  filter(!is.na(`Pickup point`), `Pickup point` != "") %>%
+  distinct(`Pickup point`) %>%
+  rename(Name = `Pickup point`)
+```
+
+# Pass 1 — exact match on the combined reference name
+
+```{r pass1}
+fac_match_table <- match_coords(fac_unique$Name, locs_ref_long)
+pp_match_table  <- match_coords(pp_unique$Name,  locs_ref_long)
+```
+
+# Short-name reference (used by passes 2 and 3)
+
+The DHIS short facility name is used for the second and third matching passes.
+
+
+```{r short-ref}
+short_ref <- facilities %>%
+  transmute(
+    ref_name_full  = `Facility Name`,
+    ref_name_short = `Short Facility Name`,
+    Longitude      = suppressWarnings(as.numeric(longitude)),
+    Latitude       = suppressWarnings(as.numeric(latitude))
+  ) %>%
+  filter(!is.na(ref_name_short), ref_name_short != "",
+         !is.na(Longitude), !is.na(Latitude)) %>%
+  distinct(ref_name_short, .keep_all = TRUE)
+```
+
+# Pass 2 — exact match on the DHIS short facility name
+
+```{r pass2}
+fac_unmatched <- fac_match_table %>% filter(is.na(Longitude) | is.na(Latitude)) %>% select(Name)
+pup_unmatched <- pp_match_table  %>% filter(is.na(Longitude) | is.na(Latitude)) %>% select(Name)
+
+fac_short_hits <- fac_unmatched %>%
+  inner_join(short_ref, by = c("Name" = "ref_name_short")) %>%
+  transmute(Name, Longitude, Latitude,
+            matched_ref = Name, matched_ref_raw = ref_name_full,
+            src = "facilities_short", method = "raw_exact_short")
+
+pup_short_hits <- pup_unmatched %>%
+  inner_join(short_ref, by = c("Name" = "ref_name_short")) %>%
+  transmute(Name, Longitude, Latitude,
+            matched_ref = Name, matched_ref_raw = ref_name_full,
+            src = "facilities_short", method = "raw_exact_short")
+
+fac_match_table <- apply_rescue(fac_match_table, fac_short_hits)
+pp_match_table  <- apply_rescue(pp_match_table,  pup_short_hits)
+```
+
+# Pass 3 — short name with "clinic" removed from both sides
+
+```{r pass3}
+fac_unmatched <- fac_match_table %>% filter(is.na(Longitude) | is.na(Latitude)) %>% select(Name)
+pup_unmatched <- pp_match_table  %>% filter(is.na(Longitude) | is.na(Latitude)) %>% select(Name)
+
+fac_short_hits <- fac_unmatched %>%
+  mutate(Name_nc = rm_word(Name, "clinic")) %>%
+  inner_join(short_ref %>% mutate(ref_name_short_nc = rm_word(ref_name_short, "clinic")),
+             by = c("Name_nc" = "ref_name_short_nc")) %>%
+  transmute(Name, Longitude, Latitude,
+            matched_ref = Name_nc, matched_ref_raw = ref_name_full,
+            src = "facilities_short_nc", method = "raw_exact_short_nc") %>%
+  distinct(Name, .keep_all = TRUE)
+
+pup_short_hits <- pup_unmatched %>%
+  mutate(Name_nc = rm_word(Name, "clinic")) %>%
+  inner_join(short_ref %>% mutate(ref_name_short_nc = rm_word(ref_name_short, "clinic")),
+             by = c("Name_nc" = "ref_name_short_nc")) %>%
+  transmute(Name, Longitude, Latitude,
+            matched_ref = Name_nc, matched_ref_raw = ref_name_full,
+            src = "facilities_short_nc", method = "raw_exact_short_nc") %>%
+  distinct(Name, .keep_all = TRUE)
+
+fac_match_table <- apply_rescue(fac_match_table, fac_short_hits)
+pp_match_table  <- apply_rescue(pp_match_table,  pup_short_hits)
+```
+
+# QC: unmatched names
+
+Rows that remain unmatched are completed manually in the exported audit workbook.
+
+
+```{r unmatched-count}
+message("Facilities still unmatched: ",
+        nrow(fac_match_table[is.na(fac_match_table$Longitude) | is.na(fac_match_table$Latitude), ]),
+        " of ", nrow(fac_match_table))
+message("Pickup points still unmatched: ",
+        nrow(pp_match_table[is.na(pp_match_table$Longitude) | is.na(pp_match_table$Latitude), ]),
+        " of ", nrow(pp_match_table))
+```
+
+# Attach administrative labels
+
+Province, District, and Sub District are taken from the Step 3 data so that each site retains the administrative area under which it was recorded.
+
+
+```{r admin-labels}
+fac_admin_lookup <- full %>%
+  filter(!is.na(Facility), Facility != "") %>%
+  group_by(Facility) %>%
+  summarise(Province_full    = first_nm(Province),
+            District_full    = first_nm(District),
+            Subdistrict_full = first_nm(`Sub District`),
+            .groups = "drop")
+
+pp_admin_lookup <- full %>%
+  filter(!is.na(`Pickup point`), `Pickup point` != "") %>%
+  group_by(`Pickup point`) %>%
+  summarise(Province_full    = first_nm(Province),
+            District_full    = first_nm(District),
+            Subdistrict_full = first_nm(`Sub District`),
+            .groups = "drop")
+
+fac_match_table <- fac_match_table %>% left_join(fac_admin_lookup, by = c("Name" = "Facility"))
+pp_match_table  <- pp_match_table  %>% left_join(pp_admin_lookup,  by = c("Name" = "Pickup point"))
+```
+
+# Export audit workbook
+
+```{r save-audit}
+
+# Rows with missing coordinates are completed manually.
+# The completed workbook is used in the next pipeline step.
+write.xlsx(
+  list(
+    Facilities = fac_match_table,
+    PickupPoints = pp_match_table
+  ),
+  audit_out_xlsx,
+  asTable = TRUE,
+  overwrite = TRUE
+)
+```
