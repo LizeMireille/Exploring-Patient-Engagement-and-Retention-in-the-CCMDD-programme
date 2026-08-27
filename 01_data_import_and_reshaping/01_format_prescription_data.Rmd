@@ -1,0 +1,284 @@
+---
+title: "Step 1 — Formatting the October 2025 prescription extract"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# load in libraries
+library(data.table)
+library(tidyr)
+library(future.apply)
+```
+
+# Purpose
+
+This file takes the prescription level data received in October 2025 and reshapes it into a dataframe with one row per prescription.
+
+A custom parser is used and does the following:
+
+1. read every field as plain text
+2. then uses the script date as an anchor to
+   tell the address block (which comes before the date) apart from the
+   structured fields (which come after the date).
+   
+
+Input - October 2025 prescription extract (raw)
+Output - R object, `synch_all` (one row per October prescription)
+
+
+# Configuration
+
+```{r config}
+
+# Path to the raw October 2025 extract.
+# The raw data are not included in this repository.
+zip_path <- "......."
+
+# Folder containing the prescription CSVs within the source zip.
+inner_dir <- "Synchsd-4206 Nikhil Oct 2025"  # subject to change
+
+```
+
+# The parser
+
+```{r parser}
+
+# Final output columns:
+#   Province, District, Sub District, Registered date, Facility, Pickup point,
+#   Patient address, Prescription Date, Prescription Status, patient_id,
+#   prescription_id, Gender, date of birth, Months Supplied,
+#   Prescription Length, Prescription Items
+#
+# Layout of a the raw input
+#   1st 6 cols are fixed with comma separator 
+#   7th is the address (varying number of commas that form part of the address) 
+#   8th Prescription Date
+#   9 Structured fields
+#   Last: Prescription Items 
+
+
+# function input: p is the file path to one raw prescription CSV
+
+normalize_synch_fast <- function(p) {
+  
+  dt <- data.table::fread(
+    p,                      
+    sep        = ",",                  # set comma as the separator to start with 
+    header     = TRUE,
+    quote      = "",                   # do not treat quotation marks as start and end of a field 
+    fill       = Inf,                  # avoid early stopping on too many fields
+    colClasses = "character",          # read everything as character 
+    na.strings = c("", "NA", "N/A"),   # treat all of these as missing values
+    showProgress = FALSE               
+  )
+  if (!nrow(dt)) return(data.table())  # adding to stop if the current file happens to be blank 
+
+  
+  # make sure the table has at least 6 columns before renaming them.
+  # if the file has fewer than 6 columns overall, add empty placeholder columns.
+  if (ncol(dt) < 6L) {          
+    for (k in (ncol(dt) + 1L):6L) dt[[k]] <- NA_character_  
+  }
+  # rename the first 6 columns by position, since these should always be the fixed location/date fields.
+  setnames(dt, old = names(dt)[1:6],
+           new = c("Province", "District", "Sub District",
+                   "Registered date", "Facility", "Pickup point")) 
+  
+
+  #### everything from column 7 onward is the section we have to reshape ################################################################
+  
+  # count the number of cols separated by commas so that we can go from 7 onwards 
+  nc <- ncol(dt)
+  
+  
+  # if only the 6 cols from above exists, return the fixed fields and add the remaining fields as blank
+  if (nc < 7L) {
+    
+
+    out <- dt[, .(
+      Province, District, `Sub District`, `Registered date`, Facility, `Pickup point`,
+      `Patient address`     = NA_character_,
+      `Prescription Date`   = NA_character_,
+      `Prescription Status` = NA_character_,
+      patient_id            = NA_character_,
+      prescription_id       = NA_character_,
+      Gender                = NA_character_,
+      `date of birth`       = NA_character_,
+      `Months Supplied`     = NA_character_,
+      `Prescription Length` = NA_character_,
+      `Prescription Items`  = NA_character_
+    )]
+    out[, source_file := basename(p)]
+    return(out[])
+  }
+
+  
+  # find the tail columns
+  tail_cols <- 7L:nc
+  tail_mat  <- as.matrix(dt[, ..tail_cols])
+  n         <- nrow(dt)
+  
+  
+  # tail_mat now contains the imported columns from col 7 onward
+  # this is converted to a matrix so we can search across each row by position 
+
+  # create a pattern to identify dates in the tail columns
+  # this matches observed dates in YYYY-MM-DD format, optionally followed by a time
+  # the year is restricted to 2021-2025 based on the know data range.
+  date_re   <- "^202[1-5]-\\d{2}-\\d{2}(?:\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?)?$"
+  
+  # check each value in the imported tail section and mark whether it looks like a date.
+  date_mask <- apply(tail_mat, 2L, function(x) grepl(date_re, x))
+  
+  # date_mask should be a matrix so row/column indexing works
+  # if apply() simplifies the result, replace it with a same-sized FALSE matrix.
+  if (!is.matrix(date_mask)) {
+    date_mask <- matrix(FALSE, nrow = nrow(tail_mat), ncol = ncol(tail_mat))
+  }
+
+
+  # find the position of the first date in each tail row.
+  # the address ends right before this date.
+  # max.col() always returns a position, even if no TRUE/date is found.
+  # to handle that, add a fake FALSE column at the start and subtract 1 to make sure 
+  # the rows with no dates are at position 0
+  pos <- max.col(cbind(FALSE, date_mask), ties.method = "first") - 1L
+
+  
+  
+  # patient address = the tail before pos
+  addr <- ifelse(
+    pos == 0L,
+    # there is no date and we treat the whole tail as the address (unlikely)
+    apply(tail_mat, 1L, function(z) {
+      z <- z[!is.na(z) & nzchar(trimws(z))]
+      if (length(z)) paste(z, collapse = ",") else NA_character_
+    }),
+    
+    # if pos is greater than 0, a date was found in the tail row.
+    # the address is made from the values before that date.
+    vapply(seq_len(n), function(i) {
+      # if the date is the first value in the tail, there is no address before it
+      if (pos[i] <= 1L) return(NA_character_)
+      
+       # take all tail values before the date position
+      z <- as.character(tail_mat[i, 1:(pos[i] - 1L)])
+      
+       # remove missing and blank address pieces
+      z <- z[!is.na(z) & nzchar(trimws(z))]
+      
+      # join the remaining address pieces back together with commas
+      # if there is nothing left, return NA
+      if (length(z)) paste(z, collapse = ",") else NA_character_
+    }, FUN.VALUE = character(1))
+  )
+
+  # pull out the prescription date itself
+  # if no date was found in the row, set Prescription Date to NA
+  # pmax(pos, 1L) is only there to keep the matrix index valid, because matrix positions cannot be 0
+  pdate <- ifelse(pos == 0L, NA_character_,
+                  tail_mat[cbind(seq_len(n), pmax(pos, 1L))])
+
+  # collect everything after the prescription date for each row
+  # this should contain the 7 structured fields first, followed by Prescription Items
+  after_list <- lapply(seq_len(n), function(i) {
+    
+    # if no date was found, there is no reliable prescription section to extract
+    if (pos[i] == 0L) return(character(0))
+    
+    # start one position after the date
+    j1 <- pos[i] + 1L
+    
+    # if the date is the last value in the tail, there is nothing after it
+    if (j1 > ncol(tail_mat)) character(0)
+    else as.character(tail_mat[i, j1:ncol(tail_mat)])
+  })
+
+  # pull the kth value after the prescription date from each row
+  # this is used for the structured fields that always appear in the same order.
+  take_field <- function(k) {
+    vapply(after_list, function(v) {
+      
+      
+      # if the row has at least k values after the date, and the kth value is not blank,
+      # return that value with extra spaces removed
+      if (length(v) >= k && nzchar(trimws(v[k]))) trimws(v[k]) else NA_character_
+    }, FUN.VALUE = character(1))
+  }
+  
+  # the first 7 values after the prescription date are the structured fields
+  presc_status    <- take_field(1)
+  patient_id      <- take_field(2)
+  prescription_id <- take_field(3)
+  gender          <- take_field(4)
+  dob             <- take_field(5)
+  months_sup      <- take_field(6)
+  presc_len       <- take_field(7)
+
+  # anything after the 7 structured fields is Prescription Items
+  # join these pieces back together because item text may also contain commas
+  items <- vapply(after_list, function(v) {
+    if (length(v) > 7L) {
+      
+       # take values 8 onward, remove extra spaces, and drop blanks
+      z <- trimws(v[8L:length(v)])
+      z <- z[nzchar(z)]
+      
+      # join remaining item pieces back together
+      if (length(z)) paste(z, collapse = ", ") else NA_character_
+    } else NA_character_
+  }, FUN.VALUE = character(1))
+
+  # build the final cleaned table with one row per prescription
+  out <- data.table(
+    Province = dt[[1]], District = dt[[2]], `Sub District` = dt[[3]],
+    `Registered date` = dt[[4]], Facility = dt[[5]], `Pickup point` = dt[[6]],
+    `Patient address`     = trimws(addr),
+    `Prescription Date`   = pdate,
+    `Prescription Status` = presc_status,
+    patient_id            = patient_id,
+    prescription_id       = prescription_id,
+    Gender                = gender,
+    `date of birth`       = dob,
+    `Months Supplied`     = months_sup,
+    `Prescription Length` = presc_len,
+    `Prescription Items`  = items
+  )
+  out[, source_file := basename(p)]
+  out[]
+}
+```
+
+# Extract and parse all October CSVs
+
+```{r extract-and-parse}
+
+# list the csvs inside the target folder of the zip.
+zip_idx     <- utils::unzip(zip_path, list = TRUE)
+csv_entries <- zip_idx$Name[grepl(paste0("^", inner_dir, "/.*\\.csv$"), zip_idx$Name)]
+stopifnot(length(csv_entries) > 0)
+
+# extract just those csvs to a temp folder.
+exdir <- tempfile("synchsd_")
+dir.create(exdir, recursive = TRUE, showWarnings = FALSE)
+utils::unzip(zip_path, files = csv_entries, exdir = exdir)
+csv_paths <- file.path(exdir, csv_entries)
+
+# parse every CSV in parallel and stack the results.
+plan(multisession, workers = max(1L, parallel::detectCores() - 1))
+dt_list   <- future_lapply(csv_paths, normalize_synch_fast, future.seed = TRUE)
+plan(sequential)
+synch_all <- data.table::rbindlist(dt_list, use.names = TRUE, fill = TRUE)
+
+# Finalise the R object
+synch_all[, source_file := NULL]
+```
+
+
+# Quick look
+
+```{r summary}
+skimr::skim(synch_all)
+```
+

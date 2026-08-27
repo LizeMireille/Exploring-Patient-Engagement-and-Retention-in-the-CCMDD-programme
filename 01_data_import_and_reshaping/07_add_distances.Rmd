@@ -1,0 +1,267 @@
+---
+title: "Step 7 — Adding coordinates and Facility↔Pickup-point distance"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(readxl)
+library(data.table)
+library(skimr)
+```
+
+# Purpose
+
+This file attaches coordinates to each package's `Facility` and `Pickup point`, then calculates the distance between the two as a proxy for how far a patient travels from their clinic to collect medication.
+
+It uses the manually completed coordinate mapping produced after Step 6.
+
+The `distance_euclid` measure is the straight-line Euclidean distance calculated directly from longitude and latitude degrees:
+
+`sqrt((Δlatitude)^2 + (Δlongitude)^2)`
+
+It is not a true geographic distance and is used only as a relative proxy for travel distance.
+
+Inputs:
+- `packages_scripts_merged` from Step 3
+- `locations_match_audit._filled.xlsx` (Step 6 coordinate mapping after manual completion)
+
+Output:
+- `packages_with_distance` (package-level data with a computable Facility-to-Pickup-point distance)
+
+
+
+# Configuration
+
+```{r config}
+# Step 3 must be run first to create the package-prescription object.
+if (!exists("packages_scripts_merged")) {
+  stop("Run Step 3 first to create `packages_scripts_merged`.")
+}
+
+# Manually completed coordinate mapping from Step 6.
+# This file is included in the repository.
+coords_xlsx <- "locations_match_audit._filled.xlsx"
+```
+
+# Load inputs
+
+```{r load}
+# coordinate mappings completed after Step 6.
+facilities <- read_excel(
+  coords_xlsx,
+  sheet = "Facilities"
+)
+
+pickup_points <- read_excel(
+  coords_xlsx,
+  sheet = "PickupPoints"
+)
+
+# create a working copy of the package-level dataset from Step 3.
+full <- copy(packages_scripts_merged)
+setDT(full)
+```
+
+# Tidy the name fields
+
+```{r tidy-names}
+# treat "", "null", "n/a", "na" (any case) as missing.
+nullish <- function(x) is.na(x) | tolower(trimws(x)) %in% c("", "null", "n/a", "na")
+
+# drop packages with no patient_id (can't be used at person level downstream).
+full <- full[!is.na(patient_id) & trimws(as.character(patient_id)) != ""]
+
+# normalise placeholder blanks in the name fields to real NA.
+full[, `:=`(
+  Facility       = ifelse(nullish(Facility), NA_character_, Facility),
+  `Pickup point` = ifelse(nullish(`Pickup point`), NA_character_, `Pickup point`)
+)]
+```
+
+# Build coordinate lookups
+
+```{r coord-lookups}
+# coordinates may use a comma decimal separator; convert to a numeric.
+to_num <- function(x) as.numeric(str_replace(as.character(x), ",", "."))
+
+# one row per facility / pickup-point name (keep the first if duplicated).
+fac_lu <- as.data.table(facilities)[
+  , .(Facility = Name, fac_lon = to_num(Longitude), fac_lat = to_num(Latitude))
+][, .SD[1], by = Facility]
+
+pup_lu <- as.data.table(pickup_points)[
+  , .(`Pickup point` = Name, pup_lon = to_num(Longitude), pup_lat = to_num(Latitude))
+][, .SD[1], by = `Pickup point`]
+```
+
+# Join coordinates and compute distance
+
+```{r distance}
+# attach facility and pickup-point coordinates, then the eucl (degree-based)
+# distance between them. Rows missing either coordinate get NA.
+full_with_distance <- full %>%
+  left_join(fac_lu, by = "Facility") %>%
+  left_join(pup_lu, by = "Pickup point") %>%
+  mutate(
+    distance_euclid = ifelse(
+      is.na(fac_lon) | is.na(fac_lat) | is.na(pup_lon) | is.na(pup_lat),
+      NA_real_,
+      sqrt((fac_lat - pup_lat)^2 + (fac_lon - pup_lon)^2)
+    )
+  ) %>%
+  select(-fac_lon, -fac_lat, -pup_lon, -pup_lat)
+
+setDT(full_with_distance)
+message("Rows with no computable distance (missing a coordinate): ",
+        sum(is.na(full_with_distance$distance_euclid)))
+```
+
+# Same site, no coordinates → distance 0
+
+```{r same-site-zero}
+# if the facility and pickup point have the same name but we couldn't compute a distance (a coordinate was missing), 
+# the patient collects at their clinic, so distance is 0.
+full_with_distance[Facility == `Pickup point` & is.na(distance_euclid),
+                   distance_euclid := 0]
+
+message("Rows with no computable distance after the same-site fill: ",
+        sum(is.na(full_with_distance$distance_euclid)))
+```
+
+# Same site recorded under different names (QC + manual fix)
+
+Some rows have a distance of approximately zero because the Facility and Pickup point have identical coordinates, but the two fields use different names for the same physical site.
+
+These known variants are harmonised to a single canonical name.
+
+```{r inspect-zero-distance}
+# zero-distance rows whose two names differ: candidates for name harmonisation.
+df_same_place_diff_name <- as.data.frame(full_with_distance[
+  !is.na(distance_euclid) & abs(distance_euclid) < 1e-9 & Facility != `Pickup point`
+])
+nrow(df_same_place_diff_name)
+
+# the distinct names involved (used to build the manual map below).
+sort(unique(df_same_place_diff_name$Facility))
+sort(unique(df_same_place_diff_name$`Pickup point`))
+```
+
+```{r manual-name-map}
+# Manual name corrections for known variants of the same physical site.
+# These were identified from the zero-distance pairs above.
+# Each `from` name is replaced with the standard `to` name so that the same
+# place is labelled consistently across the dataset.
+manual_map <- data.table(
+  from = c(
+    "HD: Braemer Clinic",
+    "HD : St Chads chc",
+    "Eshowe Gateway", "Eshowe Hosp: Hospital Pharmacy", "Eshowe Hosp: Sinethemba Clinic Pharmacy",
+    "EG Usher Gateway",
+    "Wentworth Gateway",
+    "Rietvlei Gateway",
+    "Osindisweni Hosp: Main Pharmacy",
+    "Appelsbosch Gateway", "Appelsbosch Mob 1", "Appelsbosch Mob 2",
+    "Mseleni Gateway",
+    "Umphumulo Gateway",
+    "Verulam Medical Clinic _ Dr Lashika Athmaram",
+    "St Andrew's Gateway",
+    "St Apollinaris Mob 1", "St Apollinaris Mob 2",
+    "Greytown Mob 1", "Greytown Mob 2",
+    "Butterworth Gateway",
+    "Sekororo Gateway",
+    "Lebowakgomo Gateway",
+    "Madadeni Gateway",
+    "Mosvold Gateway",
+    "HD : Nhlazatshe 4 Clinic",
+    "C Johnson Mob 1", "C Johnson Mob 3",
+    "Utrecht Mob 1", "Utrecht Mob 2", "Utrecht Mob 3",
+    "Manguzi Mob 1", "Manguzi Mob 2", "Manguzi Mob 3",
+    "St Margaret's TB MDR Hosp", "St Margaret's Clinic", "St Margaret's Gateway",
+    "Sterkspruit Town Clinic", "Sterkspruit Crisis Centre",
+    "Church Scot Mob 1", "Church Scot Mob 2"
+  ),
+  to = c(
+    "Braemer Clinic",
+    "St Chads CHC",
+    "Eshowe Hosp", "Eshowe Hosp", "Eshowe Hosp",
+    "EG Usher Mem Hosp",
+    "Wentworth Hosp",
+    "Rietvlei Hosp",
+    "Osindisweni Hosp",
+    "Appelsbosch Hosp", "Appelsbosch Hosp", "Appelsbosch Hosp",
+    "Mseleni Hosp",
+    "Umphumulo Hosp",
+    "Verulam Clinic",
+    "St Andrew's Hosp",
+    "St Apollinaris", "St Apollinaris",
+    "Greytown", "Greytown",
+    "Butterworth Hosp",
+    "Sekororo Hosp",
+    "Lebowakgomo Hosp",
+    "Madadeni Hosp",
+    "Mosvold Hosp",
+    "Nhlazatshe Clinic",
+    "C Johnson", "C Johnson",
+    "Utrecht", "Utrecht", "Utrecht",
+    "Manguzi", "Manguzi", "Manguzi",
+    "St Margaret's", "St Margaret's", "St Margaret's",
+    "Sterkspruit", "Sterkspruit",
+    "Church Scot", "Church Scot"
+  )
+)
+
+# Replace a name with its canonical form (leave unmapped names unchanged).
+recode_one <- function(x, map) map[.(x), on = .(from), ifelse(is.na(to), x, to)]
+
+# Apply across the WHOLE dataset so every occurrence of a variant name is
+# harmonised consistently (not only the zero-distance rows the map was built from).
+full_with_distance[, `Pickup point` := recode_one(`Pickup point`, manual_map)]
+full_with_distance[, Facility       := recode_one(Facility,       manual_map)]
+```
+
+# Check after name harmonisation
+
+```{r check-after-map}
+# after harmonising, check how many zero-distance rows there are
+# and how many Facility and Pickup point names now match.
+full_with_distance[, .(
+  zero_distance = sum(
+    !is.na(distance_euclid) &
+      abs(distance_euclid) < 1e-9
+  ),
+  same_name = sum(
+    !is.na(Facility) &
+      !is.na(`Pickup point`) &
+      Facility == `Pickup point`
+  )
+)]
+```
+
+# Create final Step 7 object
+
+```{r final-object}
+# keep only rows where a distance could be calculated or assigned.
+packages_with_distance <- full_with_distance[
+  !is.na(distance_euclid)
+]
+
+message(
+  "Rows kept: ",
+  nrow(packages_with_distance),
+  " of ",
+  nrow(full_with_distance),
+  " (",
+  nrow(full_with_distance) - nrow(packages_with_distance),
+  " dropped)"
+)
+```
+
+# Quick look
+
+```{r summary}
+skim(packages_with_distance)
+```
