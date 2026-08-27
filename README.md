@@ -10,24 +10,17 @@ The repository is organised according to the main stages of the analysis workflo
 
 ### `01_data_import_and_reshaping/`
 
-Contains scripts used to read in the raw SyNCH and prescription datasets, reshape files where needed, clean column formats, and prepare the datasets for later linkage and analysis.
+Contains scripts used to read in the raw SyNCH and prescription datasets, reshape files where needed, clean column formats, and prepare the datasets for analysis.
 
-### `02_mapping_and_lookup_tables/`
-
-Contains scripts and supporting lookup tables used to create and apply location and medicine mappings. This includes matching facility and pickup point information, assigning coordinates, extracting medication names, and grouping medicines into broader medication categories.
-
-### `03_exploratory_data_analysis/`
+### `02_exploratory_data_analysis/`
 
 Contains scripts used for exploratory data analysis, including summaries and figures describing the data structure, geographic distribution, timing of records, medicine group distributions, and parcel-level outcome patterns.
 
-### `04_proxy_outcomes_and_patient_tables/`
+### `03_proxy_outcomes_and_patient_tables/`
 
 Contains scripts used to define the proxy outcomes for patient engagement and retention, classify parcel collection behaviour, and align prescription-level and parcel-level information. This step creates the final patient-level analysis tables used for modelling.
 
-### `05_modelling/`
+### `04_modelling/`
 
 Contains scripts used for the final modelling analyses, including model preparation, training, evaluation, and summary outputs.
 
-## Notes
-
-The scripts are intended to be run in order, following the numbered folder structure. Some scripts rely on intermediate outputs created in earlier stages of the workflow.
