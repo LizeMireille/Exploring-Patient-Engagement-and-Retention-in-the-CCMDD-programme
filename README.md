@@ -8,6 +8,10 @@ No raw patient-level data are included in this repository.
 
 The repository is organised according to the main stages of the analysis workflow:
 
+### `00_shared/`
+
+Contains shared setup and helper scripts used across the analysis, including data paths, the files used to pass data between stages, modelling and evaluation functions, and figure styling. These scripts are mainly used by stages 03 and 04 rather than run directly.
+
 ### `01_data_import_and_reshaping/`
 
 Contains scripts used to read in the raw SyNCH and prescription datasets, reshape files where needed, clean column formats, and prepare the datasets for analysis.
